@@ -1,8 +1,9 @@
 # Author: Wei Xue <xuewei4d@gmail.com>
 #         Thierry Guillemot <thierry.guillemot.work@gmail.com>
-# License: BSD 3 clauseimport warnings
+# License: BSD 3 clause
 
 import sys
+import copy
 import warnings
 
 import numpy as np
@@ -473,7 +474,7 @@ def _naive_lmvnpdf_diag(X, means, covars):
 def test_gaussian_mixture_log_probabilities():
     from sklearn.mixture.gaussian_mixture import _estimate_log_gaussian_prob
 
-    # test aginst with _naive_lmvnpdf_diag
+    # test against with _naive_lmvnpdf_diag
     rng = np.random.RandomState(0)
     rand_data = RandomData(rng)
     n_samples = 500
@@ -569,6 +570,26 @@ def test_gaussian_mixture_predict_predict_proba():
         assert_greater(adjusted_rand_score(Y, Y_pred), .95)
 
 
+def test_gaussian_mixture_fit_predict():
+    rng = np.random.RandomState(0)
+    rand_data = RandomData(rng)
+    for covar_type in COVARIANCE_TYPE:
+        X = rand_data.X[covar_type]
+        Y = rand_data.Y
+        g = GaussianMixture(n_components=rand_data.n_components,
+                            random_state=rng, weights_init=rand_data.weights,
+                            means_init=rand_data.means,
+                            precisions_init=rand_data.precisions[covar_type],
+                            covariance_type=covar_type)
+
+        # check if fit_predict(X) is equivalent to fit(X).predict(X)
+        f = copy.deepcopy(g)
+        Y_pred1 = f.fit(X).predict(X)
+        Y_pred2 = g.fit_predict(X)
+        assert_array_equal(Y_pred1, Y_pred2)
+        assert_greater(adjusted_rand_score(Y, Y_pred2), .95)
+
+
 def test_gaussian_mixture_fit():
     # recover the ground truth
     rng = np.random.RandomState(0)
@@ -649,7 +670,7 @@ def test_gaussian_mixture_fit_convergence_warning():
                             max_iter=max_iter, reg_covar=0, random_state=rng,
                             covariance_type=covar_type)
         assert_warns_message(ConvergenceWarning,
-                             'Initialization %d did not converged. '
+                             'Initialization %d did not converge. '
                              'Try different init parameters, '
                              'or increase max_iter, tol '
                              'or check for degenerate data.'

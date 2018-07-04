@@ -1,18 +1,23 @@
-
 # Authors:
 #
 #          Giorgio Patrini
 #
 # License: BSD 3 clause
+from __future__ import division
 
 import warnings
+import re
+import itertools
+
 import numpy as np
 import numpy.linalg as la
-from scipy import sparse
+from scipy import sparse, stats
 from distutils.version import LooseVersion
+import pytest
 
 from sklearn.utils import gen_batches
 
+from sklearn.utils.testing import assert_raise_message
 from sklearn.utils.testing import assert_almost_equal
 from sklearn.utils.testing import clean_warning_registry
 from sklearn.utils.testing import assert_array_almost_equal
@@ -28,28 +33,32 @@ from sklearn.utils.testing import assert_false
 from sklearn.utils.testing import assert_warns_message
 from sklearn.utils.testing import assert_no_warnings
 from sklearn.utils.testing import assert_allclose
+from sklearn.utils.testing import assert_allclose_dense_sparse
 from sklearn.utils.testing import skip_if_32bit
 
 from sklearn.utils.sparsefuncs import mean_variance_axis
-from sklearn.preprocessing.data import _transform_selected
 from sklearn.preprocessing.data import _handle_zeros_in_scale
 from sklearn.preprocessing.data import Binarizer
 from sklearn.preprocessing.data import KernelCenterer
 from sklearn.preprocessing.data import Normalizer
 from sklearn.preprocessing.data import normalize
-from sklearn.preprocessing.data import OneHotEncoder
 from sklearn.preprocessing.data import StandardScaler
 from sklearn.preprocessing.data import scale
 from sklearn.preprocessing.data import MinMaxScaler
 from sklearn.preprocessing.data import minmax_scale
+from sklearn.preprocessing.data import QuantileTransformer
+from sklearn.preprocessing.data import quantile_transform
 from sklearn.preprocessing.data import MaxAbsScaler
 from sklearn.preprocessing.data import maxabs_scale
 from sklearn.preprocessing.data import RobustScaler
 from sklearn.preprocessing.data import robust_scale
 from sklearn.preprocessing.data import add_dummy_feature
 from sklearn.preprocessing.data import PolynomialFeatures
-from sklearn.exceptions import DataConversionWarning
+from sklearn.preprocessing.data import PowerTransformer
+from sklearn.preprocessing.data import power_transform
+from sklearn.exceptions import DataConversionWarning, NotFittedError
 
+from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import cross_val_predict
 from sklearn.svm import SVR
@@ -141,9 +150,32 @@ def test_polynomial_feature_names():
                         'b c^2', 'c^3'], feature_names)
     # test some unicode
     poly = PolynomialFeatures(degree=1, include_bias=True).fit(X)
-    feature_names = poly.get_feature_names([u"\u0001F40D", u"\u262E", u"\u05D0"])
+    feature_names = poly.get_feature_names(
+        [u"\u0001F40D", u"\u262E", u"\u05D0"])
     assert_array_equal([u"1", u"\u0001F40D", u"\u262E", u"\u05D0"],
                        feature_names)
+
+
+@pytest.mark.parametrize(['deg', 'include_bias', 'interaction_only', 'dtype'],
+                         [(1, True, False, int),
+                          (2, True, False, int),
+                          (2, True, False, np.float32),
+                          (2, True, False, np.float64),
+                          (3, False, False, np.float64),
+                          (3, False, True, np.float64)])
+def test_polynomial_features_sparse_X(deg, include_bias, interaction_only,
+                                      dtype):
+    rng = np.random.RandomState(0)
+    X = rng.randint(0, 2, (100, 2))
+    X_sparse = sparse.csr_matrix(X)
+
+    est = PolynomialFeatures(deg, include_bias=include_bias)
+    Xt_sparse = est.fit_transform(X_sparse.astype(dtype))
+    Xt_dense = est.fit_transform(X.astype(dtype))
+
+    assert isinstance(Xt_sparse, sparse.csc_matrix)
+    assert Xt_sparse.dtype == Xt_dense.dtype
+    assert_array_almost_equal(Xt_sparse.A, Xt_dense)
 
 
 def test_standard_scaler_1d():
@@ -668,6 +700,85 @@ def test_scaler_without_centering():
     assert_array_almost_equal(X_csc_scaled_back.toarray(), X)
 
 
+@pytest.mark.parametrize("with_mean", [True, False])
+@pytest.mark.parametrize("with_std", [True, False])
+@pytest.mark.parametrize("array_constructor",
+                         [np.asarray, sparse.csc_matrix, sparse.csr_matrix])
+def test_scaler_n_samples_seen_with_nan(with_mean, with_std,
+                                        array_constructor):
+    X = np.array([[0, 1, 3],
+                  [np.nan, 6, 10],
+                  [5, 4, np.nan],
+                  [8, 0, np.nan]],
+                 dtype=np.float64)
+    X = array_constructor(X)
+
+    if sparse.issparse(X) and with_mean:
+        pytest.skip("'with_mean=True' cannot be used with sparse matrix.")
+
+    transformer = StandardScaler(with_mean=with_mean, with_std=with_std)
+    transformer.fit(X)
+
+    assert_array_equal(transformer.n_samples_seen_, np.array([3, 4, 2]))
+
+
+def _check_identity_scalers_attributes(scaler_1, scaler_2):
+    assert scaler_1.mean_ is scaler_2.mean_ is None
+    assert scaler_1.var_ is scaler_2.var_ is None
+    assert scaler_1.scale_ is scaler_2.scale_ is None
+    assert scaler_1.n_samples_seen_ == scaler_2.n_samples_seen_
+
+
+def test_scaler_return_identity():
+    # test that the scaler return identity when with_mean and with_std are
+    # False
+    X_dense = np.array([[0, 1, 3],
+                        [5, 6, 0],
+                        [8, 0, 10]],
+                       dtype=np.float64)
+    X_csr = sparse.csr_matrix(X_dense)
+    X_csc = X_csr.tocsc()
+
+    transformer_dense = StandardScaler(with_mean=False, with_std=False)
+    X_trans_dense = transformer_dense.fit_transform(X_dense)
+
+    transformer_csr = clone(transformer_dense)
+    X_trans_csr = transformer_csr.fit_transform(X_csr)
+
+    transformer_csc = clone(transformer_dense)
+    X_trans_csc = transformer_csc.fit_transform(X_csc)
+
+    assert_allclose_dense_sparse(X_trans_csr, X_csr)
+    assert_allclose_dense_sparse(X_trans_csc, X_csc)
+    assert_allclose(X_trans_dense, X_dense)
+
+    for trans_1, trans_2 in itertools.combinations([transformer_dense,
+                                                    transformer_csr,
+                                                    transformer_csc],
+                                                   2):
+        _check_identity_scalers_attributes(trans_1, trans_2)
+
+    transformer_dense.partial_fit(X_dense)
+    transformer_csr.partial_fit(X_csr)
+    transformer_csc.partial_fit(X_csc)
+
+    for trans_1, trans_2 in itertools.combinations([transformer_dense,
+                                                    transformer_csr,
+                                                    transformer_csc],
+                                                   2):
+        _check_identity_scalers_attributes(trans_1, trans_2)
+
+    transformer_dense.fit(X_dense)
+    transformer_csr.fit(X_csr)
+    transformer_csc.fit(X_csc)
+
+    for trans_1, trans_2 in itertools.combinations([transformer_dense,
+                                                    transformer_csr,
+                                                    transformer_csc],
+                                                   2):
+        _check_identity_scalers_attributes(trans_1, trans_2)
+
+
 def test_scaler_int():
     # test that scaler converts integer input to floating
     # for both sparse and dense matrices
@@ -789,14 +900,9 @@ def test_scale_sparse_with_mean_raise_exception():
 
 def test_scale_input_finiteness_validation():
     # Check if non finite inputs raise ValueError
-    X = [[np.nan, 5, 6, 7, 8]]
-    assert_raises_regex(ValueError,
-                        "Input contains NaN, infinity or a value too large",
-                        scale, X)
-
     X = [[np.inf, 5, 6, 7, 8]]
     assert_raises_regex(ValueError,
-                        "Input contains NaN, infinity or a value too large",
+                        "Input contains infinity or a value too large",
                         scale, X)
 
 
@@ -851,6 +957,346 @@ def test_robust_scaler_iris_quantiles():
     assert_array_almost_equal(q_range, 1)
 
 
+def test_quantile_transform_iris():
+    X = iris.data
+    # uniform output distribution
+    transformer = QuantileTransformer(n_quantiles=30)
+    X_trans = transformer.fit_transform(X)
+    X_trans_inv = transformer.inverse_transform(X_trans)
+    assert_array_almost_equal(X, X_trans_inv)
+    # normal output distribution
+    transformer = QuantileTransformer(n_quantiles=30,
+                                      output_distribution='normal')
+    X_trans = transformer.fit_transform(X)
+    X_trans_inv = transformer.inverse_transform(X_trans)
+    assert_array_almost_equal(X, X_trans_inv)
+    # make sure it is possible to take the inverse of a sparse matrix
+    # which contain negative value; this is the case in the iris dataset
+    X_sparse = sparse.csc_matrix(X)
+    X_sparse_tran = transformer.fit_transform(X_sparse)
+    X_sparse_tran_inv = transformer.inverse_transform(X_sparse_tran)
+    assert_array_almost_equal(X_sparse.A, X_sparse_tran_inv.A)
+
+
+def test_quantile_transform_check_error():
+    X = np.transpose([[0, 25, 50, 0, 0, 0, 75, 0, 0, 100],
+                      [2, 4, 0, 0, 6, 8, 0, 10, 0, 0],
+                      [0, 0, 2.6, 4.1, 0, 0, 2.3, 0, 9.5, 0.1]])
+    X = sparse.csc_matrix(X)
+    X_neg = np.transpose([[0, 25, 50, 0, 0, 0, 75, 0, 0, 100],
+                          [-2, 4, 0, 0, 6, 8, 0, 10, 0, 0],
+                          [0, 0, 2.6, 4.1, 0, 0, 2.3, 0, 9.5, 0.1]])
+    X_neg = sparse.csc_matrix(X_neg)
+
+    assert_raises_regex(ValueError, "Invalid value for 'n_quantiles': 0.",
+                        QuantileTransformer(n_quantiles=0).fit, X)
+    assert_raises_regex(ValueError, "Invalid value for 'subsample': 0.",
+                        QuantileTransformer(subsample=0).fit, X)
+    assert_raises_regex(ValueError, "The number of quantiles cannot be"
+                        " greater than the number of samples used. Got"
+                        " 1000 quantiles and 10 samples.",
+                        QuantileTransformer(subsample=10).fit, X)
+
+    transformer = QuantileTransformer(n_quantiles=10)
+    assert_raises_regex(ValueError, "QuantileTransformer only accepts "
+                        "non-negative sparse matrices.",
+                        transformer.fit, X_neg)
+    transformer.fit(X)
+    assert_raises_regex(ValueError, "QuantileTransformer only accepts "
+                        "non-negative sparse matrices.",
+                        transformer.transform, X_neg)
+
+    X_bad_feat = np.transpose([[0, 25, 50, 0, 0, 0, 75, 0, 0, 100],
+                               [0, 0, 2.6, 4.1, 0, 0, 2.3, 0, 9.5, 0.1]])
+    assert_raises_regex(ValueError, "X does not have the same number of "
+                        "features as the previously fitted data. Got 2"
+                        " instead of 3.",
+                        transformer.transform, X_bad_feat)
+    assert_raises_regex(ValueError, "X does not have the same number of "
+                        "features as the previously fitted data. Got 2"
+                        " instead of 3.",
+                        transformer.inverse_transform, X_bad_feat)
+
+    transformer = QuantileTransformer(n_quantiles=10,
+                                      output_distribution='rnd')
+    # check that an error is raised at fit time
+    assert_raises_regex(ValueError, "'output_distribution' has to be either"
+                        " 'normal' or 'uniform'. Got 'rnd' instead.",
+                        transformer.fit, X)
+    # check that an error is raised at transform time
+    transformer.output_distribution = 'uniform'
+    transformer.fit(X)
+    X_tran = transformer.transform(X)
+    transformer.output_distribution = 'rnd'
+    assert_raises_regex(ValueError, "'output_distribution' has to be either"
+                        " 'normal' or 'uniform'. Got 'rnd' instead.",
+                        transformer.transform, X)
+    # check that an error is raised at inverse_transform time
+    assert_raises_regex(ValueError, "'output_distribution' has to be either"
+                        " 'normal' or 'uniform'. Got 'rnd' instead.",
+                        transformer.inverse_transform, X_tran)
+    # check that an error is raised if input is scalar
+    assert_raise_message(ValueError,
+                         'Expected 2D array, got scalar array instead',
+                         transformer.transform, 10)
+
+
+def test_quantile_transform_sparse_ignore_zeros():
+    X = np.array([[0, 1],
+                  [0, 0],
+                  [0, 2],
+                  [0, 2],
+                  [0, 1]])
+    X_sparse = sparse.csc_matrix(X)
+    transformer = QuantileTransformer(ignore_implicit_zeros=True,
+                                      n_quantiles=5)
+
+    # dense case -> warning raise
+    assert_warns_message(UserWarning, "'ignore_implicit_zeros' takes effect"
+                         " only with sparse matrix. This parameter has no"
+                         " effect.", transformer.fit, X)
+
+    X_expected = np.array([[0, 0],
+                           [0, 0],
+                           [0, 1],
+                           [0, 1],
+                           [0, 0]])
+    X_trans = transformer.fit_transform(X_sparse)
+    assert_almost_equal(X_expected, X_trans.A)
+
+    # consider the case where sparse entries are missing values and user-given
+    # zeros are to be considered
+    X_data = np.array([0, 0, 1, 0, 2, 2, 1, 0, 1, 2, 0])
+    X_col = np.array([0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    X_row = np.array([0, 4, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+    X_sparse = sparse.csc_matrix((X_data, (X_row, X_col)))
+    X_trans = transformer.fit_transform(X_sparse)
+    X_expected = np.array([[0., 0.5],
+                           [0., 0.],
+                           [0., 1.],
+                           [0., 1.],
+                           [0., 0.5],
+                           [0., 0.],
+                           [0., 0.5],
+                           [0., 1.],
+                           [0., 0.]])
+    assert_almost_equal(X_expected, X_trans.A)
+
+    transformer = QuantileTransformer(ignore_implicit_zeros=True,
+                                      n_quantiles=5)
+    X_data = np.array([-1, -1, 1, 0, 0, 0, 1, -1, 1])
+    X_col = np.array([0, 0, 1, 1, 1, 1, 1, 1, 1])
+    X_row = np.array([0, 4, 0, 1, 2, 3, 4, 5, 6])
+    X_sparse = sparse.csc_matrix((X_data, (X_row, X_col)))
+    X_trans = transformer.fit_transform(X_sparse)
+    X_expected = np.array([[0, 1],
+                           [0, 0.375],
+                           [0, 0.375],
+                           [0, 0.375],
+                           [0, 1],
+                           [0, 0],
+                           [0, 1]])
+    assert_almost_equal(X_expected, X_trans.A)
+    assert_almost_equal(X_sparse.A, transformer.inverse_transform(X_trans).A)
+
+    # check in conjunction with subsampling
+    transformer = QuantileTransformer(ignore_implicit_zeros=True,
+                                      n_quantiles=5,
+                                      subsample=8,
+                                      random_state=0)
+    X_trans = transformer.fit_transform(X_sparse)
+    assert_almost_equal(X_expected, X_trans.A)
+    assert_almost_equal(X_sparse.A, transformer.inverse_transform(X_trans).A)
+
+
+def test_quantile_transform_dense_toy():
+    X = np.array([[0, 2, 2.6],
+                  [25, 4, 4.1],
+                  [50, 6, 2.3],
+                  [75, 8, 9.5],
+                  [100, 10, 0.1]])
+
+    transformer = QuantileTransformer(n_quantiles=5)
+    transformer.fit(X)
+
+    # using the a uniform output, each entry of X should be map between 0 and 1
+    # and equally spaced
+    X_trans = transformer.fit_transform(X)
+    X_expected = np.tile(np.linspace(0, 1, num=5), (3, 1)).T
+    assert_almost_equal(np.sort(X_trans, axis=0), X_expected)
+
+    X_test = np.array([
+        [-1, 1, 0],
+        [101, 11, 10],
+    ])
+    X_expected = np.array([
+        [0, 0, 0],
+        [1, 1, 1],
+    ])
+    assert_array_almost_equal(transformer.transform(X_test), X_expected)
+
+    X_trans_inv = transformer.inverse_transform(X_trans)
+    assert_array_almost_equal(X, X_trans_inv)
+
+
+def test_quantile_transform_subsampling():
+    # Test that subsampling the input yield to a consistent results We check
+    # that the computed quantiles are almost mapped to a [0, 1] vector where
+    # values are equally spaced. The infinite norm is checked to be smaller
+    # than a given threshold. This is repeated 5 times.
+
+    # dense support
+    n_samples = 1000000
+    n_quantiles = 1000
+    X = np.sort(np.random.sample((n_samples, 1)), axis=0)
+    ROUND = 5
+    inf_norm_arr = []
+    for random_state in range(ROUND):
+        transformer = QuantileTransformer(random_state=random_state,
+                                          n_quantiles=n_quantiles,
+                                          subsample=n_samples // 10)
+        transformer.fit(X)
+        diff = (np.linspace(0, 1, n_quantiles) -
+                np.ravel(transformer.quantiles_))
+        inf_norm = np.max(np.abs(diff))
+        assert_true(inf_norm < 1e-2)
+        inf_norm_arr.append(inf_norm)
+    # each random subsampling yield a unique approximation to the expected
+    # linspace CDF
+    assert_equal(len(np.unique(inf_norm_arr)), len(inf_norm_arr))
+
+    # sparse support
+
+    X = sparse.rand(n_samples, 1, density=.99, format='csc', random_state=0)
+    inf_norm_arr = []
+    for random_state in range(ROUND):
+        transformer = QuantileTransformer(random_state=random_state,
+                                          n_quantiles=n_quantiles,
+                                          subsample=n_samples // 10)
+        transformer.fit(X)
+        diff = (np.linspace(0, 1, n_quantiles) -
+                np.ravel(transformer.quantiles_))
+        inf_norm = np.max(np.abs(diff))
+        assert_true(inf_norm < 1e-1)
+        inf_norm_arr.append(inf_norm)
+    # each random subsampling yield a unique approximation to the expected
+    # linspace CDF
+    assert_equal(len(np.unique(inf_norm_arr)), len(inf_norm_arr))
+
+
+def test_quantile_transform_sparse_toy():
+    X = np.array([[0., 2., 0.],
+                  [25., 4., 0.],
+                  [50., 0., 2.6],
+                  [0., 0., 4.1],
+                  [0., 6., 0.],
+                  [0., 8., 0.],
+                  [75., 0., 2.3],
+                  [0., 10., 0.],
+                  [0., 0., 9.5],
+                  [100., 0., 0.1]])
+
+    X = sparse.csc_matrix(X)
+
+    transformer = QuantileTransformer(n_quantiles=10)
+    transformer.fit(X)
+
+    X_trans = transformer.fit_transform(X)
+    assert_array_almost_equal(np.min(X_trans.toarray(), axis=0), 0.)
+    assert_array_almost_equal(np.max(X_trans.toarray(), axis=0), 1.)
+
+    X_trans_inv = transformer.inverse_transform(X_trans)
+    assert_array_almost_equal(X.toarray(), X_trans_inv.toarray())
+
+    transformer_dense = QuantileTransformer(n_quantiles=10).fit(
+        X.toarray())
+
+    X_trans = transformer_dense.transform(X)
+    assert_array_almost_equal(np.min(X_trans.toarray(), axis=0), 0.)
+    assert_array_almost_equal(np.max(X_trans.toarray(), axis=0), 1.)
+
+    X_trans_inv = transformer_dense.inverse_transform(X_trans)
+    assert_array_almost_equal(X.toarray(), X_trans_inv.toarray())
+
+
+def test_quantile_transform_axis1():
+    X = np.array([[0, 25, 50, 75, 100],
+                  [2, 4, 6, 8, 10],
+                  [2.6, 4.1, 2.3, 9.5, 0.1]])
+
+    X_trans_a0 = quantile_transform(X.T, axis=0, n_quantiles=5)
+    X_trans_a1 = quantile_transform(X, axis=1, n_quantiles=5)
+    assert_array_almost_equal(X_trans_a0, X_trans_a1.T)
+
+
+def test_quantile_transform_bounds():
+    # Lower and upper bounds are manually mapped. We checked that in the case
+    # of a constant feature and binary feature, the bounds are properly mapped.
+    X_dense = np.array([[0, 0],
+                        [0, 0],
+                        [1, 0]])
+    X_sparse = sparse.csc_matrix(X_dense)
+
+    # check sparse and dense are consistent
+    X_trans = QuantileTransformer(n_quantiles=3,
+                                  random_state=0).fit_transform(X_dense)
+    assert_array_almost_equal(X_trans, X_dense)
+    X_trans_sp = QuantileTransformer(n_quantiles=3,
+                                     random_state=0).fit_transform(X_sparse)
+    assert_array_almost_equal(X_trans_sp.A, X_dense)
+    assert_array_almost_equal(X_trans, X_trans_sp.A)
+
+    # check the consistency of the bounds by learning on 1 matrix
+    # and transforming another
+    X = np.array([[0, 1],
+                  [0, 0.5],
+                  [1, 0]])
+    X1 = np.array([[0, 0.1],
+                   [0, 0.5],
+                   [1, 0.1]])
+    transformer = QuantileTransformer(n_quantiles=3).fit(X)
+    X_trans = transformer.transform(X1)
+    assert_array_almost_equal(X_trans, X1)
+
+    # check that values outside of the range learned will be mapped properly.
+    X = np.random.random((1000, 1))
+    transformer = QuantileTransformer()
+    transformer.fit(X)
+    assert_equal(transformer.transform([[-10]]),
+                 transformer.transform([[np.min(X)]]))
+    assert_equal(transformer.transform([[10]]),
+                 transformer.transform([[np.max(X)]]))
+    assert_equal(transformer.inverse_transform([[-10]]),
+                 transformer.inverse_transform(
+                     [[np.min(transformer.references_)]]))
+    assert_equal(transformer.inverse_transform([[10]]),
+                 transformer.inverse_transform(
+                     [[np.max(transformer.references_)]]))
+
+
+def test_quantile_transform_and_inverse():
+    # iris dataset
+    X = iris.data
+    transformer = QuantileTransformer(n_quantiles=1000, random_state=0)
+    X_trans = transformer.fit_transform(X)
+    X_trans_inv = transformer.inverse_transform(X_trans)
+    assert_array_almost_equal(X, X_trans_inv)
+
+
+def test_quantile_transform_nan():
+    X = np.array([[np.nan, 0,  0, 1],
+                  [np.nan, np.nan, 0, 0.5],
+                  [np.nan, 1, 1, 0]])
+
+    transformer = QuantileTransformer(n_quantiles=10, random_state=42)
+    transformer.fit_transform(X)
+
+    # check that the quantile of the first column is all NaN
+    assert np.isnan(transformer.quantiles_[:, 0]).all()
+    # all other column should not contain NaN
+    assert not np.isnan(transformer.quantiles_[:, 1:]).any()
+
+
 def test_robust_scaler_invalid_range():
     for range_ in [
         (-1, 90),
@@ -861,7 +1307,7 @@ def test_robust_scaler_invalid_range():
     ]:
         scaler = RobustScaler(quantile_range=range_)
 
-        assert_raises_regex(ValueError, 'Invalid quantile range: \(',
+        assert_raises_regex(ValueError, r'Invalid quantile range: \(',
                             scaler.fit, iris.data)
 
 
@@ -904,6 +1350,15 @@ def test_robust_scale_axis1():
     X_trans = robust_scale(X, axis=1)
     assert_array_almost_equal(np.median(X_trans, axis=1), 0)
     q = np.percentile(X_trans, q=(25, 75), axis=1)
+    iqr = q[1] - q[0]
+    assert_array_almost_equal(iqr, 1)
+
+
+def test_robust_scale_1d_array():
+    X = iris.data[:, 1]
+    X_trans = robust_scale(X)
+    assert_array_almost_equal(np.median(X_trans), 0)
+    q = np.percentile(X_trans, q=(25, 75))
     iqr = q[1] - q[0]
     assert_array_almost_equal(iqr, 1)
 
@@ -1405,7 +1860,8 @@ def test_cv_pipeline_precomputed():
     y_true = np.ones((4,))
     K = X.dot(X.T)
     kcent = KernelCenterer()
-    pipeline = Pipeline([("kernel_centerer", kcent), ("svr", SVR())])
+    pipeline = Pipeline([("kernel_centerer", kcent), ("svr",
+                        SVR(gamma='scale'))])
 
     # did the pipeline set the _pairwise attribute?
     assert_true(pipeline._pairwise)
@@ -1453,180 +1909,6 @@ def test_add_dummy_feature_csr():
     assert_array_equal(X.toarray(), [[1, 1, 0], [1, 0, 1], [1, 0, 1]])
 
 
-def test_one_hot_encoder_sparse():
-    # Test OneHotEncoder's fit and transform.
-    X = [[3, 2, 1], [0, 1, 1]]
-    enc = OneHotEncoder()
-    # discover max values automatically
-    X_trans = enc.fit_transform(X).toarray()
-    assert_equal(X_trans.shape, (2, 5))
-    assert_array_equal(enc.active_features_,
-                       np.where([1, 0, 0, 1, 0, 1, 1, 0, 1])[0])
-    assert_array_equal(enc.feature_indices_, [0, 4, 7, 9])
-
-    # check outcome
-    assert_array_equal(X_trans,
-                       [[0., 1., 0., 1., 1.],
-                        [1., 0., 1., 0., 1.]])
-
-    # max value given as 3
-    enc = OneHotEncoder(n_values=4)
-    X_trans = enc.fit_transform(X)
-    assert_equal(X_trans.shape, (2, 4 * 3))
-    assert_array_equal(enc.feature_indices_, [0, 4, 8, 12])
-
-    # max value given per feature
-    enc = OneHotEncoder(n_values=[3, 2, 2])
-    X = [[1, 0, 1], [0, 1, 1]]
-    X_trans = enc.fit_transform(X)
-    assert_equal(X_trans.shape, (2, 3 + 2 + 2))
-    assert_array_equal(enc.n_values_, [3, 2, 2])
-    # check that testing with larger feature works:
-    X = np.array([[2, 0, 1], [0, 1, 1]])
-    enc.transform(X)
-
-    # test that an error is raised when out of bounds:
-    X_too_large = [[0, 2, 1], [0, 1, 1]]
-    assert_raises(ValueError, enc.transform, X_too_large)
-    error_msg = "unknown categorical feature present \[2\] during transform."
-    assert_raises_regex(ValueError, error_msg, enc.transform, X_too_large)
-    assert_raises(ValueError, OneHotEncoder(n_values=2).fit_transform, X)
-
-    # test that error is raised when wrong number of features
-    assert_raises(ValueError, enc.transform, X[:, :-1])
-    # test that error is raised when wrong number of features in fit
-    # with prespecified n_values
-    assert_raises(ValueError, enc.fit, X[:, :-1])
-    # test exception on wrong init param
-    assert_raises(TypeError, OneHotEncoder(n_values=np.int).fit, X)
-
-    enc = OneHotEncoder()
-    # test negative input to fit
-    assert_raises(ValueError, enc.fit, [[0], [-1]])
-
-    # test negative input to transform
-    enc.fit([[0], [1]])
-    assert_raises(ValueError, enc.transform, [[0], [-1]])
-
-
-def test_one_hot_encoder_dense():
-    # check for sparse=False
-    X = [[3, 2, 1], [0, 1, 1]]
-    enc = OneHotEncoder(sparse=False)
-    # discover max values automatically
-    X_trans = enc.fit_transform(X)
-    assert_equal(X_trans.shape, (2, 5))
-    assert_array_equal(enc.active_features_,
-                       np.where([1, 0, 0, 1, 0, 1, 1, 0, 1])[0])
-    assert_array_equal(enc.feature_indices_, [0, 4, 7, 9])
-
-    # check outcome
-    assert_array_equal(X_trans,
-                       np.array([[0., 1., 0., 1., 1.],
-                                 [1., 0., 1., 0., 1.]]))
-
-
-def _check_transform_selected(X, X_expected, sel):
-    for M in (X, sparse.csr_matrix(X)):
-        Xtr = _transform_selected(M, Binarizer().transform, sel)
-        assert_array_equal(toarray(Xtr), X_expected)
-
-
-def test_transform_selected():
-    X = [[3, 2, 1], [0, 1, 1]]
-
-    X_expected = [[1, 2, 1], [0, 1, 1]]
-    _check_transform_selected(X, X_expected, [0])
-    _check_transform_selected(X, X_expected, [True, False, False])
-
-    X_expected = [[1, 1, 1], [0, 1, 1]]
-    _check_transform_selected(X, X_expected, [0, 1, 2])
-    _check_transform_selected(X, X_expected, [True, True, True])
-    _check_transform_selected(X, X_expected, "all")
-
-    _check_transform_selected(X, X, [])
-    _check_transform_selected(X, X, [False, False, False])
-
-
-def test_transform_selected_copy_arg():
-    # transformer that alters X
-    def _mutating_transformer(X):
-        X[0, 0] = X[0, 0] + 1
-        return X
-
-    original_X = np.asarray([[1, 2], [3, 4]])
-    expected_Xtr = [[2, 2], [3, 4]]
-
-    X = original_X.copy()
-    Xtr = _transform_selected(X, _mutating_transformer, copy=True,
-                              selected='all')
-
-    assert_array_equal(toarray(X), toarray(original_X))
-    assert_array_equal(toarray(Xtr), expected_Xtr)
-
-
-def _run_one_hot(X, X2, cat):
-    enc = OneHotEncoder(categorical_features=cat)
-    Xtr = enc.fit_transform(X)
-    X2tr = enc.transform(X2)
-    return Xtr, X2tr
-
-
-def _check_one_hot(X, X2, cat, n_features):
-    ind = np.where(cat)[0]
-    # With mask
-    A, B = _run_one_hot(X, X2, cat)
-    # With indices
-    C, D = _run_one_hot(X, X2, ind)
-    # Check shape
-    assert_equal(A.shape, (2, n_features))
-    assert_equal(B.shape, (1, n_features))
-    assert_equal(C.shape, (2, n_features))
-    assert_equal(D.shape, (1, n_features))
-    # Check that mask and indices give the same results
-    assert_array_equal(toarray(A), toarray(C))
-    assert_array_equal(toarray(B), toarray(D))
-
-
-def test_one_hot_encoder_categorical_features():
-    X = np.array([[3, 2, 1], [0, 1, 1]])
-    X2 = np.array([[1, 1, 1]])
-
-    cat = [True, False, False]
-    _check_one_hot(X, X2, cat, 4)
-
-    # Edge case: all non-categorical
-    cat = [False, False, False]
-    _check_one_hot(X, X2, cat, 3)
-
-    # Edge case: all categorical
-    cat = [True, True, True]
-    _check_one_hot(X, X2, cat, 5)
-
-
-def test_one_hot_encoder_unknown_transform():
-    X = np.array([[0, 2, 1], [1, 0, 3], [1, 0, 2]])
-    y = np.array([[4, 1, 1]])
-
-    # Test that one hot encoder raises error for unknown features
-    # present during transform.
-    oh = OneHotEncoder(handle_unknown='error')
-    oh.fit(X)
-    assert_raises(ValueError, oh.transform, y)
-
-    # Test the ignore option, ignores unknown features.
-    oh = OneHotEncoder(handle_unknown='ignore')
-    oh.fit(X)
-    assert_array_equal(
-        oh.transform(y).toarray(),
-        np.array([[0.,  0.,  0.,  0.,  1.,  0.,  0.]]))
-
-    # Raise error if handle_unknown is neither ignore or error.
-    oh = OneHotEncoder(handle_unknown='42')
-    oh.fit(X)
-    assert_raises(ValueError, oh.transform, y)
-
-
 def test_fit_cold_start():
     X = iris.data
     X_2d = X[:, :2]
@@ -1641,3 +1923,133 @@ def test_fit_cold_start():
         # with a different shape, this may break the scaler unless the internal
         # state is reset
         scaler.fit_transform(X_2d)
+
+
+def test_quantile_transform_valid_axis():
+    X = np.array([[0, 25, 50, 75, 100],
+                  [2, 4, 6, 8, 10],
+                  [2.6, 4.1, 2.3, 9.5, 0.1]])
+
+    assert_raises_regex(ValueError, "axis should be either equal to 0 or 1"
+                        ". Got axis=2", quantile_transform, X.T, axis=2)
+
+
+def test_power_transformer_notfitted():
+    pt = PowerTransformer(method='box-cox')
+    X = np.abs(X_1col)
+    assert_raises(NotFittedError, pt.transform, X)
+    assert_raises(NotFittedError, pt.inverse_transform, X)
+
+
+def test_power_transformer_1d():
+    X = np.abs(X_1col)
+
+    for standardize in [True, False]:
+        pt = PowerTransformer(method='box-cox', standardize=standardize)
+
+        X_trans = pt.fit_transform(X)
+        X_trans_func = power_transform(X, standardize=standardize)
+
+        X_expected, lambda_expected = stats.boxcox(X.flatten())
+
+        if standardize:
+            X_expected = scale(X_expected)
+
+        assert_almost_equal(X_expected.reshape(-1, 1), X_trans)
+        assert_almost_equal(X_expected.reshape(-1, 1), X_trans_func)
+
+        assert_almost_equal(X, pt.inverse_transform(X_trans))
+        assert_almost_equal(lambda_expected, pt.lambdas_[0])
+
+        assert len(pt.lambdas_) == X.shape[1]
+        assert isinstance(pt.lambdas_, np.ndarray)
+
+
+def test_power_transformer_2d():
+    X = np.abs(X_2d)
+
+    for standardize in [True, False]:
+        pt = PowerTransformer(method='box-cox', standardize=standardize)
+
+        X_trans_class = pt.fit_transform(X)
+        X_trans_func = power_transform(X, standardize=standardize)
+
+        for X_trans in [X_trans_class, X_trans_func]:
+            for j in range(X_trans.shape[1]):
+                X_expected, lmbda = stats.boxcox(X[:, j].flatten())
+
+                if standardize:
+                    X_expected = scale(X_expected)
+
+                assert_almost_equal(X_trans[:, j], X_expected)
+                assert_almost_equal(lmbda, pt.lambdas_[j])
+
+            # Test inverse transformation
+            X_inv = pt.inverse_transform(X_trans)
+            assert_array_almost_equal(X_inv, X)
+
+        assert len(pt.lambdas_) == X.shape[1]
+        assert isinstance(pt.lambdas_, np.ndarray)
+
+
+def test_power_transformer_strictly_positive_exception():
+    pt = PowerTransformer(method='box-cox')
+    pt.fit(np.abs(X_2d))
+
+    # Exceptions should be raised for negative arrays and zero arrays
+    X_with_negatives = X_2d
+    not_positive_message = 'strictly positive'
+
+    assert_raise_message(ValueError, not_positive_message,
+                         pt.transform, X_with_negatives)
+
+    assert_raise_message(ValueError, not_positive_message,
+                         pt.fit, X_with_negatives)
+
+    assert_raise_message(ValueError, not_positive_message,
+                         power_transform, X_with_negatives)
+
+    assert_raise_message(ValueError, not_positive_message,
+                         pt.transform, np.zeros(X_2d.shape))
+
+    assert_raise_message(ValueError, not_positive_message,
+                         pt.fit, np.zeros(X_2d.shape))
+
+    assert_raise_message(ValueError, not_positive_message,
+                         power_transform, np.zeros(X_2d.shape))
+
+
+def test_power_transformer_shape_exception():
+    pt = PowerTransformer(method='box-cox')
+    X = np.abs(X_2d)
+    pt.fit(X)
+
+    # Exceptions should be raised for arrays with different num_columns
+    # than during fitting
+    wrong_shape_message = 'Input data has a different number of features'
+
+    assert_raise_message(ValueError, wrong_shape_message,
+                         pt.transform, X[:, 0:1])
+
+    assert_raise_message(ValueError, wrong_shape_message,
+                         pt.inverse_transform, X[:, 0:1])
+
+
+def test_power_transformer_method_exception():
+    pt = PowerTransformer(method='monty-python')
+    X = np.abs(X_2d)
+
+    # An exception should be raised if PowerTransformer.method isn't valid
+    bad_method_message = "'method' must be one of"
+    assert_raise_message(ValueError, bad_method_message,
+                         pt.fit, X)
+
+
+def test_power_transformer_lambda_zero():
+    pt = PowerTransformer(method='box-cox', standardize=False)
+    X = np.abs(X_2d)[:, 0:1]
+
+    # Test the lambda = 0 case
+    pt.lambdas_ = np.array([0])
+    X_trans = pt.transform(X)
+    assert_array_almost_equal(pt.inverse_transform(X_trans), X)
